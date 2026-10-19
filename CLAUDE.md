@@ -86,6 +86,8 @@ stdin JSON → process_hook()
 
 **Terminal device resolution (`$TC_DEV`)**: All iTerm2 escape sequences write to `$TC_DEV`, not stdout (Claude Code captures hook stdout) and *not* `/dev/tty` directly. Hook subprocesses spawned by Claude Code have **no controlling terminal**, so `/dev/tty` fails with "device not configured" and every color/badge write silently vanishes — the plugin appears healthy (`.state.json` still updates) while nothing is visible. `resolve_output_device()` fixes this by walking up the process tree (`ps -o tty=`/`ppid=`) to the nearest ancestor that owns a real pty (e.g. the `claude` process's `ttysNNN`), falling back to `/dev/tty` for interactive CLI use and `/dev/null` as a harmless no-op. Writes are still wrapped in `{ printf ...; } 2>/dev/null`.
 
+**Konsole backend**: When `$KONSOLE_DBUS_SERVICE`/`$KONSOLE_DBUS_SESSION` are set (and `dbus-send` exists), `TERMINAL=konsole` and the output functions call `org.kde.konsole.Session` D-Bus methods (`setTabColor`, `setTabTitleFormat`, `setBadgeText`/`setBadgeEnabled`) instead of writing escape sequences. These changes are sticky, so the session's original values are saved once to `.konsole/<service+session>/` and restored by `cmd_reset`.
+
 **Hook registration**: Hooks are registered in `~/.claude/settings.json` under the `hooks` key. The installer (`install.sh`) appends to existing catch-all matchers to coexist with other hooks (e.g. peon-ping).
 
 ### Event → State Mapping

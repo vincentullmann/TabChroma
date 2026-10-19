@@ -69,6 +69,9 @@ if [ "$TERM_PROGRAM" = "iTerm.app" ]; then
   printf '\033]6;1;bg;*;default\a' > /dev/tty
   printf '\033]1337;SetBadgeFormat=\a' > /dev/tty
   echo "Tab color reset and badge cleared."
+elif [ -n "$KONSOLE_DBUS_SESSION" ] && [ -x "$INSTALL_DIR/tab-chroma.sh" ]; then
+  "$INSTALL_DIR/tab-chroma.sh" reset > /dev/null 2>&1
+  echo "Tab color, title and badge restored."
 fi
 
 # ─── 3. Remove completions ────────────────────────────────────────────────────

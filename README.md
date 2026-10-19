@@ -18,10 +18,10 @@ iTerm2 visual feedback plugin for [Claude Code](https://claude.ai/code). Changes
 
 ## Requirements
 
-- macOS with [iTerm2](https://iterm2.com)
+- macOS with [iTerm2](https://iterm2.com), or Linux with [Konsole](https://konsole.kde.org) (see [Konsole](#konsole))
 - [Claude Code](https://claude.ai/code) CLI
 - Python 3 (standard library only)
-- **zsh** - the installer writes the shell alias and `claude()` wrapper to `~/.zshrc`. bash and fish are not supported by the installer; add the following manually to your shell rc file:
+- **zsh or bash** - the installer writes the shell alias and `claude()` wrapper to `~/.bashrc` when your login shell is bash, `~/.zshrc` otherwise. fish is not supported by the installer; add the following manually to your shell rc file:
 
 ```bash
 # Makes `tab-chroma` available as a command
@@ -35,6 +35,16 @@ claude() {
   tab-chroma reset > /dev/null 2>&1
 }
 ```
+
+### Konsole
+
+On KDE Konsole, tab-chroma drives the tab over D-Bus instead of escape sequences, using the `$KONSOLE_DBUS_SERVICE` / `$KONSOLE_DBUS_SESSION` variables Konsole exports to every session. It needs `dbus-send` (shipped with dbus) and a Konsole recent enough to expose `setTabColor` over D-Bus.
+
+- **Tab color** - set with `setTabColor`.
+- **Title** - Konsole tabs display the profile's *tab title format*, not the window title, so tab-chroma replaces the format while Claude runs.
+- **Badge** - uses Konsole's own badge; badge color has no D-Bus API and is left alone.
+
+Because these changes stick to the session, tab-chroma saves the tab's original color, title format and badge on first change and restores them on `tab-chroma reset` (which the `claude()` wrapper runs on exit).
 
 ## Installation
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# tab-chroma: iTerm2 visual feedback plugin for Claude Code
+# tab-chroma: iTerm2/Konsole visual feedback plugin for Claude Code
 # Changes tab color, badge, and title based on Claude Code hook events
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +22,9 @@ detect_terminal() {
     echo "iterm2"
   elif [ "$TERM_PROGRAM" = "Apple_Terminal" ]; then
     echo "apple-terminal"
+  elif [ -n "$KONSOLE_DBUS_SERVICE" ] && [ -n "$KONSOLE_DBUS_SESSION" ] \
+       && command -v dbus-send >/dev/null 2>&1; then
+    echo "konsole"
   elif [ -n "$KITTY_PID" ]; then
     echo "kitty"
   else
@@ -57,15 +60,78 @@ resolve_output_device() {
 
 TC_DEV="$(resolve_output_device)"
 
+# ─── Konsole D-Bus Backend ─────────────────────────────────────────────────────
+# Konsole ignores iTerm2's escape sequences but exposes tab color, tab title and
+# badge over D-Bus. Each session's service and object path are exported to its
+# shell as $KONSOLE_DBUS_SERVICE / $KONSOLE_DBUS_SESSION and inherited by Claude
+# Code's hook subprocesses, so no tty resolution is needed.
+#
+# Unlike escape sequences these changes are sticky (tab title format, badge),
+# so the session's original values are saved on first change and restored by
+# reset.
+
+KONSOLE_ORIG_DIR="$SCRIPT_DIR/.konsole/$(printf '%s%s' "$KONSOLE_DBUS_SERVICE" "$KONSOLE_DBUS_SESSION" | tr -c 'A-Za-z0-9' '_')"
+
+konsole_call() {
+  local method="$1"; shift
+  dbus-send --session --type=method_call --dest="$KONSOLE_DBUS_SERVICE" \
+    "$KONSOLE_DBUS_SESSION" "org.kde.konsole.Session.$method" "$@" >/dev/null 2>&1
+}
+
+konsole_get() {
+  local method="$1"; shift
+  dbus-send --session --print-reply=literal --dest="$KONSOLE_DBUS_SERVICE" \
+    "$KONSOLE_DBUS_SESSION" "org.kde.konsole.Session.$method" "$@" 2>/dev/null \
+    | sed '1s/^   //'
+}
+
+konsole_save_originals() {
+  [ -d "$KONSOLE_ORIG_DIR" ] && return 0
+  mkdir -p "$KONSOLE_ORIG_DIR" || return 1
+  konsole_get tabColor > "$KONSOLE_ORIG_DIR/tab_color"
+  konsole_get tabTitleFormat int32:0 > "$KONSOLE_ORIG_DIR/title_local"
+  konsole_get tabTitleFormat int32:1 > "$KONSOLE_ORIG_DIR/title_remote"
+  konsole_get badgeText > "$KONSOLE_ORIG_DIR/badge_text"
+  # dbus-send prints booleans as "boolean true"
+  konsole_get badgeEnabled | sed 's/^boolean //' > "$KONSOLE_ORIG_DIR/badge_enabled"
+}
+
+konsole_orig() {
+  cat "$KONSOLE_ORIG_DIR/$1" 2>/dev/null
+}
+
+konsole_restore_title() {
+  [ -d "$KONSOLE_ORIG_DIR" ] || return 0
+  konsole_call setTabTitleFormat int32:0 "string:$(konsole_orig title_local)"
+  konsole_call setTabTitleFormat int32:1 "string:$(konsole_orig title_remote)"
+}
+
+konsole_forget_originals() {
+  rm -rf "$KONSOLE_ORIG_DIR"
+}
+
 # ─── iTerm2 Output Functions ───────────────────────────────────────────────────
 
 set_tab_color() {
   local r=$1 g=$2 b=$3
+  if [ "$TERMINAL" = "konsole" ]; then
+    konsole_save_originals
+    konsole_call setTabColor "string:$(printf '#%02x%02x%02x' "$r" "$g" "$b")"
+    return
+  fi
   { printf '\033]6;1;bg;red;brightness;%s\a\033]6;1;bg;green;brightness;%s\a\033]6;1;bg;blue;brightness;%s\a' \
     "$r" "$g" "$b" > "$TC_DEV"; } 2>/dev/null
 }
 
 reset_tab_color() {
+  if [ "$TERMINAL" = "konsole" ]; then
+    # Konsole reports an unset tab color as #000000; an empty string unsets it
+    local orig
+    orig="$(konsole_orig tab_color)"
+    [ "$orig" = "#000000" ] && orig=""
+    [ -d "$KONSOLE_ORIG_DIR" ] && konsole_call setTabColor "string:$orig"
+    return
+  fi
   { printf '\033]6;1;bg;*;default\a' > "$TC_DEV"; } 2>/dev/null
 }
 
@@ -88,6 +154,11 @@ set_tab_title() {
   local title="$1"
   if [ "$TERMINAL" = "iterm2" ] || [ "$TERMINAL" = "apple-terminal" ]; then
     { printf '\033]0;%s\007' "$title" > "$TC_DEV"; } 2>/dev/null
+  elif [ "$TERMINAL" = "konsole" ]; then
+    # Konsole tabs show the title *format*, not the OSC window title
+    konsole_save_originals
+    konsole_call setTabTitleFormat int32:0 "string:$title"
+    konsole_call setTabTitleFormat int32:1 "string:$title"
   fi
 }
 
@@ -99,7 +170,29 @@ set_badge() {
     else
       { printf '\033]1337;SetBadgeFormat=%s\a' "$(printf '%s' "$text" | base64)" > "$TC_DEV"; } 2>/dev/null
     fi
+  elif [ "$TERMINAL" = "konsole" ]; then
+    # Konsole has no badge color API; badge_color calls are no-ops there
+    if [ -z "$text" ]; then
+      [ -d "$KONSOLE_ORIG_DIR" ] || return 0
+      konsole_call setBadgeText "string:$(konsole_orig badge_text)"
+      konsole_call setBadgeEnabled "boolean:$(konsole_orig badge_enabled)"
+    else
+      konsole_save_originals
+      konsole_call setBadgeText "string:${text//\\n/$'\n'}"
+      konsole_call setBadgeEnabled boolean:true
+    fi
   fi
+}
+
+# ─── Shell Helpers ────────────────────────────────────────────────────────────
+
+# rc file that receives the alias and claude() wrapper: ~/.bashrc for bash
+# users, ~/.zshrc otherwise
+shell_rc() {
+  case "$(basename "${SHELL:-}")" in
+    bash) printf '%s' "$HOME/.bashrc";;
+    *)    printf '%s' "$HOME/.zshrc";;
+  esac
 }
 
 # ─── Config Helpers ───────────────────────────────────────────────────────────
@@ -140,7 +233,7 @@ EOF
 
 cmd_help() {
   cat << EOF
-tab-chroma v$VERSION — iTerm2 visual feedback for Claude Code
+tab-chroma v$VERSION — iTerm2/Konsole visual feedback for Claude Code
 
 USAGE:
   tab-chroma <command> [args]
@@ -158,7 +251,7 @@ THEMES:
   theme preview [name]  Preview all states (2s each)
 
 FEATURES:
-  badge on|off          Toggle iTerm2 badge
+  badge on|off          Toggle iTerm2/Konsole badge
   title on|off          Toggle tab title updates
   color on|off          Toggle tab color changes
 
@@ -434,6 +527,10 @@ cmd_reset() {
   reset_tab_color
   reset_badge_color
   set_badge ""
+  if [ "$TERMINAL" = "konsole" ]; then
+    konsole_restore_title
+    konsole_forget_originals
+  fi
   echo "tab color reset"
 }
 
@@ -480,13 +577,14 @@ else:
 PYEOF
 
   # Set up shell alias and completions
-  local zshrc="$HOME/.zshrc"
+  local zshrc
+  zshrc="$(shell_rc)"
   local alias_line="alias tab-chroma='$hook_cmd'"
   if ! grep -qF "alias tab-chroma=" "$zshrc" 2>/dev/null; then
     echo "" >> "$zshrc"
     echo "# tab-chroma" >> "$zshrc"
     echo "$alias_line" >> "$zshrc"
-    echo "alias added to $zshrc (run: source ~/.zshrc)"
+    echo "alias added to $zshrc (run: source $zshrc)"
   fi
 
   # Add claude() wrapper so tab resets when exiting Claude Code (Ctrl+C etc.)
@@ -501,7 +599,7 @@ PYEOF
       echo '  tab-chroma reset > /dev/null 2>&1'
       echo '}'
     } >> "$zshrc"
-    echo "claude() wrapper added to $zshrc (run: source ~/.zshrc)"
+    echo "claude() wrapper added to $zshrc (run: source $zshrc)"
   fi
 
   local comp_dir="$HOME/.bash_completion.d"
@@ -554,14 +652,17 @@ PYEOF
     printf '\033]6;1;bg;*;default\a' > "$TC_DEV"
     printf '\033]1337;SetBadgeFormat=\a' > "$TC_DEV"
     echo "Tab color reset and badge cleared."
+  elif [ "$TERMINAL" = "konsole" ]; then
+    cmd_reset > /dev/null
+    echo "Tab color, title and badge restored."
   fi
 
   echo "Removing completions..."
   rm -f "$HOME/.bash_completion.d/tab-chroma"
   rm -f "$HOME/.config/fish/completions/tab-chroma.fish"
 
-  echo "Removing shell entries from ~/.zshrc..."
-  python3 - "$HOME/.zshrc" << 'PYEOF'
+  echo "Removing shell entries from $(shell_rc)..."
+  python3 - "$(shell_rc)" << 'PYEOF'
 import sys, re
 zshrc = sys.argv[1]
 try:
@@ -578,7 +679,7 @@ content = re.sub(
 )
 with open(zshrc, 'w') as f:
     f.write(content)
-print("  Removed tab-chroma entries from ~/.zshrc")
+print(f"  Removed tab-chroma entries from {zshrc}")
 PYEOF
 
   echo ""
@@ -694,7 +795,7 @@ route_cli() {
 # ─── Hook Event Processing ─────────────────────────────────────────────────────
 
 process_hook() {
-  # Only proceed for iTerm2 (or apple-terminal for title-only)
+  # Only proceed for iTerm2/Konsole (or apple-terminal for title-only)
   if [ "$TERMINAL" = "unsupported" ] || [ "$TERMINAL" = "kitty" ]; then
     exit 0
   fi
@@ -892,7 +993,7 @@ PYEOF
       reset_tab_color
       ;;
     color)
-      if [ "$TERMINAL" = "iterm2" ]; then
+      if [ "$TERMINAL" = "iterm2" ] || [ "$TERMINAL" = "konsole" ]; then
         set_tab_color "$COLOR_R" "$COLOR_G" "$COLOR_B"
       fi
       ;;
